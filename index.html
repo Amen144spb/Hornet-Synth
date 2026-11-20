@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>HORNET SYNTH</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background-color: #080512;
+      overflow: hidden;
+      font-family: Consolas, "Courier New", monospace;
+    }
+    #canvas {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      display: block;
+      box-shadow: 0 0 40px rgba(0, 0, 0, 0.9);
+    }
+  </style>
+</head>
+<body>
+<canvas id="canvas" width="1024" height="768"></canvas>
+<script>
+(function() {
+  var canvas = document.getElementById("canvas");
+  var ctx = canvas.getContext("2d");
+  var W = 1024, H = 768, SR = 44100;
+
+  var C_BG   = "rgb(8, 5, 18)";
+  var C_PNL  = "rgb(32, 22, 62)";
+  var C_KNOB = "rgb(45, 32, 85)";
+  var C_GRN  = "rgb(57, 255, 20)";
+  var C_CYN  = "rgb(0, 245, 212)";
+  var C_MAG  = "rgb(255, 0, 170)";
+  var C_PUR  = "rgb(175, 75, 255)";
+  var C_GLD  = "rgb(255, 195, 0)";
+  var C_WHT  = "rgb(240, 240, 255)";
+
+  function resizeCanvas() {
+    var scale = Math.min(window.innerWidth / W, window.innerHeight / H);
+    if (!scale || scale <= 0) scale = 1;
+    canvas.style.width = Math.floor(W * scale) + "px";
+    canvas.style.height = Math.floor(H * scale) + "px";
+  }
+  window.addEventListener("resize", resizeCanvas);
+  resizeCanvas();
+
+  var S = {
+    va: 0.0, vb: 0.0, vc: 0.0, vd: 0.0, ve: 0.0,
+    fx_c: false, fx_d: false, fx_r: false,
+    snd: true, chs: false, man: false,
+    mx: 0.0, my: 0.0, py: 0.0, pc: 0.0, pm: 0.0,
+    fang: 0.0, tx: 0.0, ty: 0.0,
+    bf: 50.0, ff: 50.0, dp: 1.0,
+    t0: Date.now() / 1000.0,
+    ci: 0, di: 0, ri: 0, clfo: 0.0
+  };
+
+  var cbuf = new Float32Array(4096 * 2);
+  var dbuf = new Float32Array(14112 * 2);
+  var rbuf = new Float32Array(4096 * 2);
+
+  var audioCtx = null;
+  var scriptNode = null;
+  var actualSR = SR;
+
+  function initAudio() {
+    try {
+      if (!audioCtx) {
+        var AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if (!AudioCtx) return;
+        audioCtx = new AudioCtx();
+        actualSR = audioCtx.sampleRate || SR;
+        scriptNode = audioCtx.createScriptProcessor(2048, 0, 2);
+        scriptNode.onaudioprocess = function(e) {
+          var outL = e.outputBuffer.getChannelData(0);
+          var outR = e.outputBuffer.getChannelData(1);
+          genChunk(outL, outR, outL.length);
+        };
+        scriptNode.connect(audioCtx.destination);
+      }
+      if (audioCtx && audioCtx.state === "suspended") {
+        audioCtx.resume();
+      }
+    } catch (err) {}
+  }
+
+  function genChunk(outL, outR, frames) {
+    var now = Date.now() / 1000.0;
+    S.bf = 50.0 + S.va * 950.0;
+
+    if (S.man) {
+      S.tx = S.mx;
+      S.ty = S.my;
+      S.dp = Math.max(0.3, Math.min(2.2, 1.0 - (S.ty - S.py) * 3.5));
+      S.py = S.ty;
+    } else {
+      S.fang += (S.vd * 0.055) * (frames / 128.0);
+      S.tx = Math.sin(S.fang) * S.ve;
+      S.ty = Math.cos(S.fang) * S.ve;
+      S.py = S.ty;
+      S.dp = Math.max(0.3, Math.min(2.2, 1.0 - Math.cos(S.fang) * (S.vd * 0.055) * S.ve * 5.0));
+    }
+
+    S.ff = Math.max(
+      20.0,
+      S.bf * S.dp + (Math.sin(S.fang * 4.0) + Math.cos((now - S.t0) * 80.0)) * S.vc * 100.0
+    );
+
+    if (!S.snd) {
+      for (var z = 0; z < frames; z++) {
+        outL[z] = 0;
+        outR[z] = 0;
+      }
+      return;
+    }
+
+    var pan = Math.max(0.0, Math.min(1.57, (S.tx * 1.2 + 1.0) * 0.785));
+    var att = 0.5 / (1.0 + S.ty * S.ty * 2.5);
+    var cosPan = Math.cos(pan) * att;
+    var sinPan = Math.sin(pan) * att;
+
+    var twoPi = 6.283185307179586;
+    var modStep = twoPi * S.ff * 2.0 / actualSR;
+    var modDepth = (1.5 + S.vb * 5.0) * S.ff * 0.12;
+
+    var pm = S.pm;
+    var pc = S.pc;
+    var ci = S.ci;
+    var di = S.di;
+    var ri = S.ri;
+    var clfo = S.clfo;
+    var lfoStep = 8.796 / actualSR;
+
+    for (var i = 0; i < frames; i++) {
+      pm = (pm + modStep) % twoPi;
+      var instFreq = S.ff + Math.sin(pm) * modDepth;
+      pc = (pc + twoPi * instFreq / actualSR) % twoPi;
+      var cs = Math.sin(pc);
+
+      var ns = Math.random() * 2.0 - 1.0;
+      var shaped = cs < 0.0 ? cs * 0.15 : cs * cs * cs;
+      var buzz = cs > 0.8 ? S.vc * ns * 0.08 : 0.0;
+      var sig = shaped * 0.8 + ns * S.vb * 0.18 + buzz;
+
+      var wl = sig * cosPan;
+      var wr = sig * sinPan;
+
+      if (S.fx_c) {
+        var idx = (ci + i) & 4095;
+        cbuf[idx * 2] = wl;
+        cbuf[idx * 2 + 1] = wr;
+        clfo = (clfo + lfoStep) % twoPi;
+        var offL = (600 + 250 * Math.sin(clfo)) | 0;
+        var offR = (600 + 250 * Math.cos(clfo)) | 0;
+        var idxL = (idx - offL + 4096) & 4095;
+        var idxR = (idx - offR + 4096) & 4095;
+        wl = wl * 0.7 + cbuf[idxL * 2] * 0.5;
+        wr = wr * 0.7 + cbuf[idxR * 2 + 1] * 0.5;
+      }
+
+      if (S.fx_d) {
+        var idxD = (di + i) % 14112;
+        var dl = dbuf[idxD * 2];
+        var dr = dbuf[idxD * 2 + 1];
+        dbuf[idxD * 2] = wl + dr * 0.45;
+        dbuf[idxD * 2 + 1] = wr + dl * 0.45;
+        wl += dl * 0.5;
+        wr += dr * 0.5;
+      }
+
+      if (S.fx_r) {
+        var idxR2 = (ri + i) & 4095;
+        var i1 = (idxR2 - 1117 + 4096) & 4095;
+        var i2 = (idxR2 - 1789 + 4096) & 4095;
+        var i3 = (idxR2 - 2657 + 4096) & 4095;
+        var rl = (rbuf[i1 * 2] + rbuf[i2 * 2]) * 0.4;
+        var rr = (rbuf[i1 * 2 + 1] + rbuf[i3 * 2 + 1]) * 0.4;
+        rbuf[idxR2 * 2] = wl + rl * 0.65;
+        rbuf[idxR2 * 2 + 1] = wr + rr * 0.65;
+        wl += rl * 0.6;
+        wr += rr * 0.6;
+      }
+
+      outL[i] = Math.max(-1.0, Math.min(1.0, wl));
+      outR[i] = Math.max(-1.0, Math.min(1.0, wr));
+    }
+
+    S.pm = pm;
+    S.pc = pc;
+    if (S.fx_c) { S.ci = (ci + frames) & 4095; S.clfo = clfo; }
+    if (S.fx_d) { S.di = (di + frames) % 14112; }
+    if (S.fx_r) { S.ri = (ri + frames) & 4095; }
+  }
+
+  var knobs = [
+    { attr: "va", kx: 230, ky: 570, lbl: "TONE(QA)",  col: C_GLD, ku: "KeyQ", kd: "KeyA", ph: 0.1 },
+    { attr: "vb", kx: 512, ky: 570, lbl: "NOISE(WS)", col: C_CYN, ku: "KeyW", kd: "KeyS", ph: 1.4 },
+    { attr: "vc", kx: 794, ky: 570, lbl: "AGIL(ED)",  col: C_MAG, ku: "KeyE", kd: "KeyD", ph: 2.7 },
+    { attr: "vd", kx: 370, ky: 690, lbl: "SPEED(RF)", col: C_GRN, ku: "KeyR", kd: "KeyF", ph: 4.0 },
+    { attr: "ve", kx: 654, ky: 690, lbl: "RAD(TG)",   col: C_PUR, ku: "KeyT", kd: "KeyG", ph: 5.3 }
+  ];
+
+  var r_chs = { x: 380, y: 20, w: 130, h: 40 };
+  var r_rnd = { x: 525, y: 20, w: 145, h: 40 };
+  var r_rst = { x: 685, y: 20, w: 135, h: 40 };
+  var r_snd = { x: 835, y: 20, w: 165, h: 40 };
+  var r_fxc = { x: 210, y: 385, w: 180, h: 38 };
+  var r_fxd = { x: 422, y: 385, w: 180, h: 38 };
+  var r_fxr = { x: 634, y: 385, w: 180, h: 38 };
+
+  var drag = null;
+  var ly = 0;
+  var trail = [];
+  var flap = 0.0;
+  var keysPressed = {};
+
+  function collidepoint(r, x, y) {
+    return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+  }
+
+  function getPos(clientX, clientY) {
+    var rect = canvas.getBoundingClientRect();
+    return {
+      x: (clientX - rect.left) * (W / rect.width),
+      y: (clientY - rect.top) * (H / rect.height)
+    };
+  }
+
+  window.addEventListener("keydown", function(e) {
+    initAudio();
+    keysPressed[e.code] = true;
+    if (e.repeat) return;
+
+    if (e.code === "Space") { e.preventDefault(); S.snd = !S.snd; }
+    if (e.code === "Digit1") S.fx_c = !S.fx_c;
+    if (e.code === "Digit2") S.fx_d = !S.fx_d;
+    if (e.code === "Digit3") S.fx_r = !S.fx_r;
+    if (e.code === "KeyZ") {
+      S.chs = false;
+      for (var i = 0; i < knobs.length; i++) S[knobs[i].attr] = 0.05 + Math.random() * 0.90;
+    }
+    if (e.code === "KeyX") S.chs = !S.chs;
+    if (e.code === "KeyC") {
+      S.chs = S.fx_c = S.fx_d = S.fx_r = false;
+      for (var j = 0; j < knobs.length; j++) S[knobs[j].attr] = 0.0;
+    }
+  });
+
+  window.addEventListener("keyup", function(e) {
+    keysPressed[e.code] = false;
+  });
+
+  function handleStart(clientX, clientY) {
+    initAudio();
+    var p = getPos(clientX, clientY);
+    var mx = p.x, my = p.y;
+
+    if (collidepoint(r_chs, mx, my)) S.chs = !S.chs;
+    if (collidepoint(r_rnd, mx, my)) {
+      S.chs = false;
+      for (var i = 0; i < knobs.length; i++) S[knobs[i].attr] = 0.05 + Math.random() * 0.90;
+    }
+    if (collidepoint(r_rst, mx, my)) {
+      S.chs = S.fx_c = S.fx_d = S.fx_r = false;
+      for (var j = 0; j < knobs.length; j++) S[knobs[j].attr] = 0.0;
+    }
+    if (collidepoint(r_snd, mx, my)) S.snd = !S.snd;
+    if (collidepoint(r_fxc, mx, my)) S.fx_c = !S.fx_c;
+    if (collidepoint(r_fxd, mx, my)) S.fx_d = !S.fx_d;
+    if (collidepoint(r_fxr, mx, my)) S.fx_r = !S.fx_r;
+
+    var rd = Math.hypot(mx - 512, my - 230);
+    if (rd <= 140) {
+      S.man = true;
+      var lim = Math.min(1.0, rd / 115.0);
+      var ang = Math.atan2(my - 230, mx - 512);
+      S.mx = Math.cos(ang) * lim;
+      S.my = Math.sin(ang) * lim;
+    }
+
+    for (var n = 0; n < knobs.length; n++) {
+      var k = knobs[n];
+      if (Math.hypot(mx - k.kx, my - k.ky) <= 45) {
+        S.chs = false;
+        drag = k.attr;
+        ly = my;
+      }
+    }
+  }
+
+  function handleMove(clientX, clientY) {
+    var p = getPos(clientX, clientY);
+    var mx = p.x, my = p.y;
+    if (drag) {
+      S[drag] = Math.max(0.0, Math.min(1.0, S[drag] + (ly - my) * 0.005));
+      ly = my;
+    }
+    if (S.man) {
+      var rd = Math.hypot(mx - 512, my - 230);
+      var lim = Math.min(1.0, rd / 115.0);
+      var ang = Math.atan2(my - 230, mx - 512);
+      S.mx = Math.cos(ang) * lim;
+      S.my = Math.sin(ang) * lim;
+    }
+  }
+
+  canvas.addEventListener("mousedown", function(e) {
+    if (e.button === 0) handleStart(e.clientX, e.clientY);
+  });
+  window.addEventListener("mouseup", function(e) {
+    if (e.button === 0) { drag = null; S.man = false; }
+  });
+  window.addEventListener("mousemove", function(e) {
+    handleMove(e.clientX, e.clientY);
+  });
+
+  canvas.addEventListener("touchstart", function(e) {
+    e.preventDefault();
+    if (e.touches.length > 0) handleStart(e.touches[0].clientX, e.touches[0].clientY);
+  }, { passive: false });
+  window.addEventListener("touchend", function() {
+    drag = null; S.man = false;
+  });
+  window.addEventListener("touchmove", function(e) {
+    if (e.touches.length > 0) handleMove(e.touches[0].clientX, e.touches[0].clientY);
+  }, { passive: false });
+
+  canvas.addEventListener("wheel", function(e) {
+    e.preventDefault();
+    initAudio();
+    var p = getPos(e.clientX, e.clientY);
+    var wy = e.deltaY < 0 ? 1 : -1;
+    for (var i = 0; i < knobs.length; i++) {
+      var k = knobs[i];
+      if (Math.hypot(p.x - k.kx, p.y - k.ky) <= 45) {
+        S.chs = false;
+        S[k.attr] = Math.max(0.0, Math.min(1.0, S[k.attr] + wy * 0.03));
+      }
+    }
+  }, { passive: false });
+
+  function roundRect(x, y, w, h, r, fill, stroke, lineWidth) {
+    var radius = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + radius, y);
+    ctx.arcTo(x + w, y, x + w, y + h, radius);
+    ctx.arcTo(x + w, y + h, x, y + h, radius);
+    ctx.arcTo(x, y + h, x, y, radius);
+    ctx.arcTo(x, y, x + w, y, radius);
+    ctx.closePath();
+    if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+    if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lineWidth || 3; ctx.stroke(); }
+  }
+
+  function drawCircle(x, y, r, fill, stroke, lineWidth) {
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+    if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lineWidth || 1; ctx.stroke(); }
+  }
+
+  function drawTop(r, txt, col, active) {
+    roundRect(r.x, r.y, r.w, r.h, 18, active ? "rgb(55, 30, 95)" : C_PNL, col, 3);
+    ctx.font = "bold 16px Consolas, monospace";
+    ctx.fillStyle = col;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(txt, r.x + r.w / 2, r.y + r.h / 2 + 1);
+  }
+
+  function drawFx(r, lbl, col, active) {
+    roundRect(r.x, r.y, r.w, r.h, 10, active ? "rgb(60, 35, 110)" : C_PNL, active ? C_GRN : col, 3);
+    drawCircle(r.x + 22, r.y + r.h / 2, 6, active ? C_GRN : "rgb(90, 80, 120)");
+    ctx.font = "bold 16px Consolas, monospace";
+    ctx.fillStyle = active ? C_GRN : C_WHT;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillText(lbl, r.x + 38, r.y + r.h / 2 + 1);
+  }
+
+  function drawBox(rx, lbl, txt, col) {
+    roundRect(rx, 435, 240, 64, 12, C_PNL, col, 3);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.font = "bold 14px Consolas, monospace";
+    ctx.fillStyle = "rgb(190, 180, 225)";
+    ctx.fillText(lbl, rx + 120, 442);
+
+    ctx.font = "bold 28px Consolas, monospace";
+    ctx.fillStyle = col;
+    ctx.fillText(txt, rx + 120, 464);
+  }
+
+  function drawKnob(k) {
+    var v = S[k.attr];
+    var pct = Math.round(v * 100);
+    drawCircle(k.kx, k.ky, 40, "rgb(75, 55, 130)");
+    drawCircle(k.kx, k.ky, 36, C_KNOB, k.col, 3);
+    drawCircle(k.kx, k.ky, 14, "rgb(25, 18, 48)");
+
+    var ang = (v * 300.0 - 90.0) * (Math.PI / 180.0);
+    var sx = k.kx + Math.cos(ang) * 8;
+    var sy = k.ky + Math.sin(ang) * 8;
+    var ex = k.kx + Math.cos(ang) * 32;
+    var ey = k.ky + Math.sin(ang) * 32;
+
+    ctx.beginPath();
+    ctx.moveTo(sx, sy);
+    ctx.lineTo(ex, ey);
+    ctx.strokeStyle = C_GRN;
+    ctx.lineWidth = 5;
+    ctx.lineCap = "round";
+    ctx.stroke();
+
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.font = "bold 16px Consolas, monospace";
+    ctx.fillStyle = k.col;
+    ctx.fillText(k.lbl, k.kx, k.ky + 42);
+
+    ctx.font = "bold 14px Consolas, monospace";
+    ctx.fillStyle = C_WHT;
+    ctx.fillText(pct + "%", k.kx, k.ky + 62);
+  }
+
+  var lastTime = Date.now();
+
+  function frame() {
+    var now = Date.now();
+    var dt = Math.min(0.05, (now - lastTime) / 1000.0);
+    lastTime = now;
+    var tSec = now / 1000.0;
+
+    for (var idx = 0; idx < knobs.length; idx++) {
+      var k = knobs[idx];
+      if (keysPressed[k.ku]) {
+        S.chs = false;
+        S[k.attr] = Math.min(1.0, S[k.attr] + 0.45 * dt);
+      }
+      if (keysPressed[k.kd]) {
+        S.chs = false;
+        S[k.attr] = Math.max(0.0, S[k.attr] - 0.45 * dt);
+      }
+      if (S.chs) {
+        S[k.attr] = 0.5 + 0.45 * Math.sin(tSec * (0.8 + idx * 0.3) + k.ph);
+      }
+    }
+
+    ctx.fillStyle = C_BG;
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.lineWidth = 1;
+    for (var col = -1; col < 18; col++) {
+      for (var row = -1; row < 12; row++) {
+        var cx = col * 60;
+        var cy = row * 68 + (col % 2 !== 0 ? 34 : 0);
+        ctx.beginPath();
+        ctx.moveTo(cx + 40, cy);
+        ctx.lineTo(cx + 20, cy + 34);
+        ctx.lineTo(cx - 20, cy + 34);
+        ctx.lineTo(cx - 40, cy);
+        ctx.lineTo(cx - 20, cy - 34);
+        ctx.lineTo(cx + 20, cy - 34);
+        ctx.closePath();
+        ctx.strokeStyle = ((col + row) & 1) !== 0 ? "rgb(42, 20, 82)" : "rgb(20, 55, 75)";
+        ctx.stroke();
+      }
+    }
+
+    drawCircle(35, 32, 8, C_GRN);
+    ctx.font = "bold 28px Consolas, monospace";
+    ctx.fillStyle = C_GLD;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillText("HORNET SYNTH", 25, 48);
+
+    drawTop(r_chs, "ХАОС(X)", S.chs ? C_GRN : C_PUR, S.chs);
+    drawTop(r_rnd, "РАНДОМ(Z)", C_GLD, false);
+    drawTop(r_rst, "СБРОС(C)", C_MAG, false);
+    drawTop(r_snd, S.snd ? "ЗВУК: ВКЛ" : "ЗВУК: ВЫКЛ", S.snd ? C_GRN : "rgb(255, 50, 80)", S.snd);
+
+    drawCircle(512, 230, 140, "rgb(14, 9, 28)", S.man ? C_CYN : C_GLD, 3);
+    drawCircle(512, 230, 146, null, C_MAG, 1);
+    drawCircle(512, 230, 80, null, "rgb(35, 75, 70)", 1);
+
+    var bx = 512 + S.tx * 115;
+    var by = 230 + S.ty * 115;
+    trail.push({ x: bx, y: by });
+    if (trail.length > 18) trail.shift();
+
+    for (var i = 0; i < trail.length; i++) {
+      var pt = trail[i];
+      drawCircle(pt.x, pt.y, Math.max(1, Math.floor(i / 3)), "rgb(0, " + (i * 14) + ", 180)");
+    }
+
+    flap += Math.max(15.0, S.ff * 0.25) * dt;
+    var sc = 1.0 + S.ty * 0.3;
+    var ws = 16 + Math.sin(flap) * 14;
+
+    ctx.fillStyle = C_PUR;
+    ctx.beginPath();
+    ctx.moveTo(bx, by);
+    ctx.lineTo(bx - (14 + ws) * sc, by - 11 * sc);
+    ctx.lineTo(bx - 11 * sc, by + 5 * sc);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.moveTo(bx, by);
+    ctx.lineTo(bx + (14 + ws) * sc, by - 11 * sc);
+    ctx.lineTo(bx + 11 * sc, by + 5 * sc);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.save();
+    ctx.translate(bx, by + 9 * sc);
+    ctx.scale(6 * sc, 9 * sc);
+    ctx.beginPath();
+    ctx.arc(0, 0, 1, 0, Math.PI * 2);
+    ctx.restore();
+    ctx.fillStyle = C_GLD;
+    ctx.fill();
+
+    drawCircle(bx, by - 5 * sc, Math.max(2, 4 * sc), C_GRN);
+
+    drawFx(r_fxc, "1: CHORUS", C_CYN, S.fx_c);
+    drawFx(r_fxd, "2: DELAY",  C_GLD, S.fx_d);
+    drawFx(r_fxr, "3: REVERB", C_MAG, S.fx_r);
+
+    drawBox(110, "ТОН", Math.trunc(S.bf) + " Hz", C_GRN);
+    drawBox(390, "ДОПЛЕР", "x" + S.dp.toFixed(2), C_GLD);
+    drawBox(670, "ИТОГ", Math.trunc(S.ff) + " Hz", C_MAG);
+
+    roundRect(110, 512, 804, 236, 18, "rgb(22, 15, 46)", C_CYN, 3);
+    for (var j = 0; j < knobs.length; j++) {
+      drawKnob(knobs[j]);
+    }
+
+    requestAnimationFrame(frame);
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
